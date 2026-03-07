@@ -121,8 +121,10 @@ final class FaceIDAuthenticationManager: ObservableObject {
                 NSLog("Touch ID 可用")
             case .none:
                 self.isBiometryAvailable = false
+                NSLog("无生物识别功能")
             @unknown default:
                 self.isBiometryAvailable = false
+                NSLog("未知生物识别类型")
             }
         } else {
             self.isBiometryAvailable = false
