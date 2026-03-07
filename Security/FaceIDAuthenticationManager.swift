@@ -357,12 +357,5 @@ extension Notification.Name {
 
 // MARK: - LAContext Extension
 
-extension LAContext {
-    var biometryType: LABiometryType {
-        if #available(iOS 11.0, *) {
-            return self.biometryType
-        } else {
-            return self.canEvaluatePolicy(LAPolicy(rawValue: 1)!, error: nil) ? .touchID : .none
-        }
-    }
-}
+// 注意：iOS 11.0+ 原生支持 biometryType 属性，不需要扩展
+// 此扩展已移除，避免无限递归
