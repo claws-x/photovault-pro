@@ -52,7 +52,6 @@ struct AuthenticationResult {
         case faceID
         case touchID
         case passcode
-        case emergencyPasscode  // 伪装模式紧急密码
     }
 }
 
@@ -63,10 +62,10 @@ struct AuthenticationConfig {
     let maxFailedAttempts: Int = 5
     /// 失败后的锁定时间 (秒)
     let lockoutDuration: TimeInterval = 30
-    /// 是否启用紧急擦除
-    let enableEmergencyWipe: Bool = true
-    /// 触发紧急擦除的失败次数
-    let emergencyWipeThreshold: Int = 10
+    /// 是否启用安全重置
+    let enableEmergencyWipe: Bool = false
+    /// 触发安全重置的失败次数
+    let securityResetThreshold: Int = 10
     /// 后台返回后需要认证的超时 (秒)，0 表示立即
     let backgroundTimeout: TimeInterval = 0
 }
@@ -81,7 +80,6 @@ final class FaceIDAuthenticationManager: ObservableObject {
     
     // MARK: - Properties
     
-    private let context = LAContext()
     private let config = AuthenticationConfig()
     
     @Published private(set) var isLocked = true
@@ -91,9 +89,6 @@ final class FaceIDAuthenticationManager: ObservableObject {
     
     private var lockoutTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
-    
-    // 认证状态回调
-    private var authCompletionHandler: ((Result<AuthenticationResult, Error>) -> Void)?
     
     // MARK: - 初始化
     
@@ -109,8 +104,7 @@ final class FaceIDAuthenticationManager: ObservableObject {
         let localContext = LAContext()
         var error: NSError?
         
-        // iOS 26 兼容：直接使用 rawValue 1 = biometry
-        if localContext.canEvaluatePolicy(LAPolicy(rawValue: 1)!, error: &error) {
+        if localContext.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) {
             self.isBiometryAvailable = true
             self.biometryType = localContext.biometryType
             
@@ -169,8 +163,7 @@ final class FaceIDAuthenticationManager: ObservableObject {
             localContext.localizedFallbackTitle = "使用密码"
         }
         
-        // 评估生物识别策略 (iOS 26: rawValue 1 = biometry)
-        localContext.evaluatePolicy(LAPolicy(rawValue: 1)!, localizedReason: reason) { [weak self] success, error in
+        localContext.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { [weak self] success, error in
             DispatchQueue.main.async {
                 self?.handleAuthenticationResult(
                     success: success,
@@ -189,8 +182,7 @@ final class FaceIDAuthenticationManager: ObservableObject {
     ) {
         let localContext = LAContext()
         
-        // iOS 26: rawValue 2 = passcode
-        localContext.evaluatePolicy(LAPolicy(rawValue: 2)!, localizedReason: reason) { [weak self] success, error in
+        localContext.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { [weak self] success, error in
             DispatchQueue.main.async {
                 self?.handleAuthenticationResult(
                     success: success,
@@ -280,8 +272,8 @@ final class FaceIDAuthenticationManager: ObservableObject {
         }
         
         if config.enableEmergencyWipe && 
-           failedAttempts >= config.emergencyWipeThreshold {
-            triggerEmergencyWipe()
+           failedAttempts >= config.securityResetThreshold {
+            triggerSecurityReset()
         }
     }
     
@@ -318,13 +310,12 @@ final class FaceIDAuthenticationManager: ObservableObject {
         resetFailedAttempts()
     }
     
-    // MARK: - 紧急擦除
+    // MARK: - 安全重置
     
-    private func triggerEmergencyWipe() {
-        NSLog("⚠️ 触发紧急数据擦除")
-        // 通知数据管理器执行安全擦除
+    private func triggerSecurityReset() {
+        NSLog("⚠️ 触发安全重置")
         NotificationCenter.default.post(
-            name: .emergencyWipeTriggered,
+            name: .securityResetTriggered,
             object: nil
         )
     }
@@ -352,7 +343,7 @@ final class FaceIDAuthenticationManager: ObservableObject {
 // MARK: - Notification Names
 
 extension Notification.Name {
-    static let emergencyWipeTriggered = Notification.Name("emergencyWipeTriggered")
+    static let securityResetTriggered = Notification.Name("securityResetTriggered")
 }
 
 // MARK: - LAContext Extension

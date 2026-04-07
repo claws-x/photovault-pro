@@ -20,12 +20,14 @@
 	<string>1</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>CFBundleDisplayName</key>
+	<string>PhotoVault Pro</string>
 	<key>NSFaceIDUsageDescription</key>
-	<string>Face ID is used to unlock your private photos and keep them secure.</string>
+	<string>Face ID is used to unlock your encrypted private photo vault on this device.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>This app needs access to your photo library to save and manage your private photos.</string>
+	<string>Photo library access is only used when you choose photos to import into your encrypted vault.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>This app needs permission to save photos to your private vault.</string>
+	<string>Photo library add access is used only if you choose to export content back to Photos in a later release.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

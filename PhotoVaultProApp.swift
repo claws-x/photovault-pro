@@ -1,467 +1,852 @@
-//
-//  PhotoVaultProApp.swift
-//  PhotoVault Pro
-//
-//  应用主入口 - 安全初始化与配置
-//
-
+import CryptoKit
+import LocalAuthentication
+import PhotosUI
 import SwiftUI
-import Combine
+import UIKit
 
 @main
 struct PhotoVaultProApp: App {
-    
-    static let shared: PhotoVaultProApp = PhotoVaultProApp()
-    
-    @StateObject private var authManager = FaceIDAuthenticationManager.shared
+    @Environment(\.scenePhase) private var scenePhase
+
+    @StateObject private var lockManager = VaultLockManager()
     @StateObject private var vaultManager = VaultManager.shared
-    @StateObject private var decoyManager = DecoyModeManager.shared
-    
-    @State private var showLockScreen = true
-    @State private var isInDecoyMode = false
-    
-    init() {
-        // 应用启动时的安全检查
-        performSecurityChecks()
-        setupCrashProtection()
-    }
-    
+    @StateObject private var privacyPreferencesStore = VaultPrivacyPreferencesStore.shared
+
     var body: some Scene {
         WindowGroup {
-            RootView(
-                showLockScreen: $showLockScreen,
-                isInDecoyMode: $isInDecoyMode
-            )
-            .environmentObject(authManager)
-            .environmentObject(vaultManager)
-            .environmentObject(decoyManager)
-            .onAppear {
-                checkAppIntegrity()
-            }
-        }
-    }
-    
-    // MARK: - 安全检查
-    
-    private func performSecurityChecks() {
-        #if !DEBUG
-        // 生产环境检查
-        
-        // 1. 越狱检测
-        if isJailbroken() {
-            NSLog("⚠️ 设备已越狱，应用功能受限")
-            // 可以选择限制功能或退出应用
-            // exit(0)
-        }
-        
-        // 2. 调试器检测
-        if isDebuggerAttached() {
-            NSLog("⚠️ 检测到调试器")
-            // 可以选择退出应用
-        }
-        
-        // 3. 系统时间验证
-        if !isSystemTimeValid() {
-            NSLog("⚠️ 系统时间可能已被篡改")
-        }
-        
-        // 4. 应用完整性检查
-        if !isAppIntegrityValid() {
-            NSLog("⚠️ 应用签名验证失败")
-        }
-        #endif
-        
-        // 5. 附加反调试保护
-        attachAntiDebugHandler()
-    }
-    
-    // MARK: - 崩溃保护
-    
-    private func setupCrashProtection() {
-        // 设置 NSSetUncaughtExceptionHandler
-        NSSetUncaughtExceptionHandler { exception in
-            NSLog("💥 未捕获的异常：\(exception.name)")
-            NSLog("原因：\(exception.reason ?? "未知")")
-            NSLog("堆栈：\(exception.callStackSymbols)")
-            
-            // 清除敏感数据
-            VaultEncryptionManager.shared.clearCachedKey()
-        }
-        
-        // 设置信号处理 - 使用 C 函数指针
-        signal(SIGSEGV, { _ in
-            NSLog("💥 SIGSEGV 信号")
-            VaultEncryptionManager.shared.clearCachedKey()
-        } as sig_t)
-        
-        signal(SIGABRT, { _ in
-            NSLog("💥 SIGABRT 信号")
-            VaultEncryptionManager.shared.clearCachedKey()
-        } as sig_t)
-    }
-    
-    // MARK: - 应用完整性检查
-    
-    private func checkAppIntegrity() {
-        // 定期检查应用完整性
-        Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { _ in
-            if !isAppIntegrityValid() {
-                NSLog("⚠️ 应用完整性检查失败")
-                // 可以采取行动，如退出应用
-            }
+            RootView()
+                .environmentObject(lockManager)
+                .environmentObject(vaultManager)
+                .environmentObject(privacyPreferencesStore)
+                .task {
+                    lockManager.bootstrap()
+                }
+                .onChange(of: scenePhase) { newPhase in
+                    if newPhase != .active && privacyPreferencesStore.preferences.autoLockOnBackground {
+                        lockManager.lock()
+                    }
+                }
         }
     }
 }
 
-// MARK: - 根视图
+@MainActor
+final class VaultLockManager: ObservableObject {
+    @Published private(set) var isConfigured = false
+    @Published private(set) var isUnlocked = false
+    @Published private(set) var biometricType: LocalAuthentication.LABiometryType = .none
+    @Published private(set) var lastError: String?
+
+    private let keychain = KeychainManager.shared
+    private let authManager = FaceIDAuthenticationManager.shared
+
+    private let passcodeHashKey = "vault_passcode_hash"
+    private let passcodeSaltKey = "vault_passcode_salt"
+    private let masterKeyIdentifier = "master_key"
+
+    func bootstrap() {
+        authManager.checkBiometryAvailability()
+        biometricType = authManager.biometryType
+        isConfigured = hasPasscodeConfigured()
+        isUnlocked = false
+    }
+
+    func createPasscode(_ passcode: String, confirmation: String) throws {
+        guard passcode == confirmation else {
+            throw VaultSetupError.passcodesDoNotMatch
+        }
+
+        guard passcode.count >= 4, passcode.count <= 8, CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: passcode)) else {
+            throw VaultSetupError.invalidPasscode
+        }
+
+        let salt = secureRandomBytes(count: SecurityConstants.saltSize)
+        let hash = hashPasscode(passcode, salt: salt)
+
+        try keychain.store(data: salt, identifier: passcodeSaltKey)
+        try keychain.store(data: hash, identifier: passcodeHashKey)
+
+        if (try? keychain.retrieveKey(identifier: masterKeyIdentifier)) == nil {
+            let masterKey = SymmetricKey(size: .bits256)
+            try keychain.store(
+                key: masterKey,
+                identifier: masterKeyIdentifier,
+                accessibility: .whenPasscodedThisDeviceOnly
+            )
+        }
+
+        isConfigured = true
+        isUnlocked = true
+        lastError = nil
+    }
+
+    func unlock(with passcode: String) -> Bool {
+        guard
+            let salt = try? keychain.retrieveData(identifier: passcodeSaltKey),
+            let hash = try? keychain.retrieveData(identifier: passcodeHashKey)
+        else {
+            lastError = "未找到锁定凭据，请重新初始化保险库。"
+            return false
+        }
+
+        let candidateHash = hashPasscode(passcode, salt: salt)
+        let isValid = constantTimeCompare(candidateHash, hash)
+        isUnlocked = isValid
+        lastError = isValid ? nil : "PIN 不正确。"
+        return isValid
+    }
+
+    func unlockWithBiometrics() {
+        authManager.authenticate(reason: "Unlock your encrypted private vault.") { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                Task { @MainActor in
+                    self.isUnlocked = true
+                    self.lastError = nil
+                }
+            case .failure(let error):
+                Task { @MainActor in
+                    self.lastError = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    func lock() {
+        isUnlocked = false
+    }
+
+    private func hasPasscodeConfigured() -> Bool {
+        ((try? keychain.retrieveData(identifier: passcodeHashKey)) ?? nil) != nil
+    }
+
+    private func hashPasscode(_ passcode: String, salt: Data) -> Data {
+        var payload = Data(passcode.utf8)
+        payload.append(salt)
+        return sha256(data: payload)
+    }
+}
+
+enum VaultSetupError: LocalizedError {
+    case invalidPasscode
+    case passcodesDoNotMatch
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidPasscode:
+            return "请设置 4 到 8 位数字 PIN。"
+        case .passcodesDoNotMatch:
+            return "两次输入的 PIN 不一致。"
+        }
+    }
+}
 
 struct RootView: View {
-    @Binding var showLockScreen: Bool
-    @Binding var isInDecoyMode: Bool
-    
-    @EnvironmentObject var authManager: FaceIDAuthenticationManager
-    @EnvironmentObject var vaultManager: VaultManager
-    @EnvironmentObject var decoyManager: DecoyModeManager
-    
+    @EnvironmentObject private var lockManager: VaultLockManager
+
     var body: some View {
         Group {
-            if showLockScreen {
-                LockScreenView(
-                    showLockScreen: $showLockScreen,
-                    isInDecoyMode: $isInDecoyMode
-                )
+            if !lockManager.isConfigured {
+                VaultOnboardingView()
+            } else if !lockManager.isUnlocked {
+                VaultUnlockView()
             } else {
-                if isInDecoyMode {
-                    DecoyMainView()
-                } else {
-                    VaultMainView()
-                }
+                VaultHomeView()
             }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .emergencyWipeTriggered)) { _ in
-            showLockScreen = true
-            isInDecoyMode = false
         }
     }
 }
 
-// MARK: - 锁屏视图
+struct VaultOnboardingView: View {
+    @EnvironmentObject private var lockManager: VaultLockManager
 
-struct LockScreenView: View {
-    @Binding var showLockScreen: Bool
-    @Binding var isInDecoyMode: Bool
-    
-    @EnvironmentObject var authManager: FaceIDAuthenticationManager
-    @EnvironmentObject var decoyManager: DecoyModeManager
-    
-    @State private var password = ""
-    @State private var showError = false
-    @State private var errorMessage = ""
-    
-    var body: some View {
-        VStack(spacing: 30) {
-            // 应用图标
-            Image(systemName: "lock.shield")
-                .font(.system(size: 80))
-                .foregroundColor(.purple)
-            
-            Text("PhotoVault Pro")
-                .font(.title)
-                .fontWeight(.semibold)
-            
-            Text("需要验证您的身份")
-                .foregroundColor(.secondary)
-            
-            // Face ID 按钮
-            Button(action: authenticateWithFaceID) {
-                Image(systemName: "faceid")
-                    .font(.system(size: 50))
-                    .foregroundColor(.purple)
-            }
-            .disabled(!authManager.isBiometryAvailable)
-            
-            // 密码输入
-            SecureField("输入密码", text: $password)
-                .textFieldStyle(RoundedBorderTextFieldStyle())
-                .frame(maxWidth: 300)
-                .keyboardType(.numberPad)
-            
-            // 错误信息
-            if showError {
-                Text(errorMessage)
-                    .foregroundColor(.red)
-                    .font(.caption)
-            }
-            
-            // 解锁按钮
-            Button(action: authenticateWithPassword) {
-                Text("解锁")
-                    .fontWeight(.semibold)
-                    .frame(maxWidth: 300)
-                    .padding()
-                    .background(Color.purple)
-                    .foregroundColor(.white)
-                    .cornerRadius(10)
-            }
-            
-            Spacer()
-        }
-        .padding()
-        .onAppear {
-            // 自动尝试 Face ID 认证
-            if authManager.isBiometryAvailable {
-                authenticateWithFaceID()
-            }
-        }
-    }
-    
-    private func authenticateWithFaceID() {
-        authManager.authenticate { result in
-            switch result {
-            case .success(let authResult):
-                handleAuthenticationSuccess(authResult)
-            case .failure(let error):
-                handleAuthenticationFailure(error)
-            }
-        }
-    }
-    
-    private func authenticateWithPassword() {
-        // 检查密码触发方式
-        let authMode = decoyManager.checkPasswordTrigger(password)
-        
-        switch authMode {
-        case .decoy:
-            // 伪装模式密码
-            isInDecoyMode = true
-            showLockScreen = false
-            password = ""
-            
-        case .real(let realPassword):
-            // 真实密码验证
-            // 这里应该验证密码哈希
-            // 框架示例：直接通过
-            showLockScreen = false
-            isInDecoyMode = false
-            password = ""
-            
-        case .emergency:
-            // 紧急密码 - 触发擦除
-            showError = true
-            errorMessage = "紧急模式已触发"
-            password = ""
-        }
-    }
-    
-    private func handleAuthenticationSuccess(_ result: AuthenticationResult) {
-        // 根据认证方式决定进入哪个模式
-        switch result.method {
-        case .faceID, .touchID:
-            // 生物识别 - 进入真实模式
-            showLockScreen = false
-            isInDecoyMode = false
-            
-        case .passcode:
-            // 密码 - 可能是伪装模式
-            // 需要进一步判断
-            showLockScreen = false
-            
-        case .emergencyPasscode:
-            // 紧急密码
-            break
-        }
-    }
-    
-    private func handleAuthenticationFailure(_ error: Error) {
-        showError = true
-        errorMessage = error.localizedDescription
-    }
-}
+    @State private var passcode = ""
+    @State private var confirmation = ""
+    @State private var errorMessage: String?
 
-// MARK: - 伪装主视图
-
-struct DecoyMainView: View {
-    @EnvironmentObject var decoyManager: DecoyModeManager
-    
-    var body: some View {
-        Group {
-            switch decoyManager.config.enabledDecoyMode {
-            case .calculator:
-                DecoyCalculatorView()
-            case .notes:
-                DecoyNotesView()
-            case .weather:
-                DecoyWeatherView()
-            case .news:
-                DecoyNewsView()
-            case .browser:
-                DecoyBrowserView()
-            }
-        }
-        .navigationBarTitle(decoyManager.config.decoyAppName)
-    }
-}
-
-// MARK: - 真实主视图
-
-struct VaultMainView: View {
-    @EnvironmentObject var vaultManager: VaultManager
-    
     var body: some View {
         NavigationView {
-            List(vaultManager.getAlbums()) { album in
-                NavigationLink(destination: AlbumDetailView(album: album)) {
-                    VStack(alignment: .leading) {
-                        Text(album.name)
-                            .font(.headline)
-                        Text("\(album.itemCount) 个项目")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("PhotoVault Pro")
+                            .font(.largeTitle.bold())
+                        Text("Build a local, encrypted vault for your private photos. Nothing is uploaded, and imports stay on device.")
+                            .foregroundStyle(.secondary)
                     }
-                }
-            }
-            .navigationTitle("隐私相册")
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button(action: createNewAlbum) {
-                        Image(systemName: "plus")
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        Label("本地加密存储", systemImage: "lock.doc")
+                        Label("系统 Photos Picker 导入", systemImage: "photo.on.rectangle")
+                        Label("PIN + Face ID 解锁", systemImage: "faceid")
                     }
-                }
-            }
-        }
-    }
-    
-    private func createNewAlbum() {
-        // 创建新相册
-    }
-}
-
-// MARK: - 伪装界面视图 (简化版)
-
-struct DecoyCalculatorView: View {
-    var body: some View {
-        VStack {
-            Text("0")
-                .font(.system(size: 60))
-                .padding()
-            
-            LazyVGrid(columns: Array(repeating: GridItem(), count: 4)) {
-                ForEach(0..<20) { i in
-                    Button(action: {}) {
-                        Text("\(i)")
-                            .frame(maxWidth: .infinity)
-                            .padding()
-                            .background(Color.gray.opacity(0.2))
-                            .cornerRadius(5)
-                    }
-                }
-            }
-        }
-    }
-}
-
-struct DecoyNotesView: View {
-    @EnvironmentObject var decoyManager: DecoyModeManager
-    
-    var body: some View {
-        List(decoyManager.getDecoyNotes()) { note in
-            VStack(alignment: .leading) {
-                Text(note.title)
                     .font(.headline)
-                Text(note.content)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+
+                    VStack(spacing: 16) {
+                        SecureField("设置 4-8 位数字 PIN", text: $passcode)
+                            .keyboardType(.numberPad)
+                            .textContentType(.oneTimeCode)
+                            .textFieldStyle(.roundedBorder)
+
+                        SecureField("再次输入 PIN", text: $confirmation)
+                            .keyboardType(.numberPad)
+                            .textContentType(.oneTimeCode)
+                            .textFieldStyle(.roundedBorder)
+
+                        if let errorMessage {
+                            Text(errorMessage)
+                                .font(.footnote)
+                                .foregroundStyle(.red)
+                        }
+
+                        Button("创建保险库", action: configureVault)
+                            .buttonStyle(.borderedProminent)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .padding(24)
             }
+            .navigationTitle("初始设置")
+        }
+    }
+
+    private func configureVault() {
+        do {
+            try lockManager.createPasscode(passcode, confirmation: confirmation)
+            errorMessage = nil
+            passcode = ""
+            confirmation = ""
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 }
 
-struct DecoyWeatherView: View {
-    @EnvironmentObject var decoyManager: DecoyModeManager
-    
-    var body: some View {
-        let weather = decoyManager.getDecoyWeather()
-        
-        VStack(spacing: 20) {
-            Text(weather.location)
-                .font(.title)
-            
-            Text("\(weather.temperature)°C")
-                .font(.system(size: 80))
-            
-            Text(weather.condition)
-                .font(.title2)
-            
-            Text("湿度：\(weather.humidity)%")
-                .foregroundColor(.secondary)
-        }
-    }
-}
+struct VaultUnlockView: View {
+    @EnvironmentObject private var lockManager: VaultLockManager
+    @EnvironmentObject private var privacyPreferencesStore: VaultPrivacyPreferencesStore
 
-struct DecoyNewsView: View {
+    @State private var passcode = ""
+
     var body: some View {
-        List {
-            ForEach(0..<10) { i in
-                VStack(alignment: .leading) {
-                    Text("新闻标题 \(i + 1)")
-                        .font(.headline)
-                    Text("这是新闻摘要内容...")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+        VStack(spacing: 24) {
+            Spacer()
+
+            Image(systemName: "lock.shield.fill")
+                .font(.system(size: 64))
+                .foregroundStyle(.blue)
+
+            VStack(spacing: 8) {
+                Text("Vault Locked")
+                    .font(.title.bold())
+                Text("Use your PIN or biometric authentication to open the encrypted vault.")
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal)
+            }
+
+            SecureField("输入 PIN", text: $passcode)
+                .keyboardType(.numberPad)
+                .textContentType(.oneTimeCode)
+                .textFieldStyle(.roundedBorder)
+                .padding(.horizontal, 24)
+
+            if let lastError = lockManager.lastError {
+                Text(lastError)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
+
+            Button("解锁") {
+                if lockManager.unlock(with: passcode) {
+                    passcode = ""
                 }
             }
+            .buttonStyle(.borderedProminent)
+
+            if privacyPreferencesStore.preferences.allowsBiometricUnlock, lockManager.biometricType != .none {
+                Button {
+                    lockManager.unlockWithBiometrics()
+                } label: {
+                    Label("使用 \(lockManager.biometricType == .faceID ? "Face ID" : "Touch ID")", systemImage: lockManager.biometricType == .faceID ? "faceid" : "touchid")
+                }
+            }
+
+            Spacer()
         }
+        .padding(.bottom, 40)
     }
 }
 
-struct DecoyBrowserView: View {
+struct VaultHomeView: View {
+    @EnvironmentObject private var lockManager: VaultLockManager
+    @EnvironmentObject private var vaultManager: VaultManager
+    @EnvironmentObject private var privacyPreferencesStore: VaultPrivacyPreferencesStore
+
+    @State private var newAlbumName = ""
+    @State private var showingCreateAlbum = false
+    @State private var showingSettings = false
+    @State private var albumPendingDeletion: VaultAlbum?
+
     var body: some View {
-        VStack {
-            TextField("输入网址", text: .constant(""))
-                .textFieldStyle(RoundedBorderTextFieldStyle())
-                .padding()
-            
-            WebViewPlaceholder()
+        NavigationView {
+            List {
+                Section {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Encrypted private photo vault")
+                            .font(.headline)
+                        Text("Imports use the system picker and stay on this device. Create separate albums to keep the vault tidy.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                Section("Albums") {
+                    if vaultManager.getAlbums().isEmpty {
+                        VaultEmptyStateView(
+                            title: "No Albums Yet",
+                            systemImage: "photo.stack",
+                            message: "Create your first album, then import photos with the system picker."
+                        )
+                    } else {
+                        ForEach(vaultManager.getAlbums()) { album in
+                            NavigationLink(destination: AlbumDetailView(album: album)) {
+                                AlbumRow(album: album)
+                            }
+                        }
+                        .onDelete(perform: requestAlbumDeletion)
+                    }
+                }
+
+                Section("Vault Status") {
+                    Label("\(vaultManager.mediaItems.count) encrypted items", systemImage: "lock.doc")
+                    Label(ByteCountFormatter.string(fromByteCount: vaultManager.storageUsage, countStyle: .file), systemImage: "internaldrive")
+                }
+            }
+            .navigationTitle("PhotoVault Pro")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Lock") {
+                        lockManager.lock()
+                    }
+                }
+
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    HStack(spacing: 14) {
+                        Button {
+                            showingSettings = true
+                        } label: {
+                            Image(systemName: "gearshape")
+                        }
+
+                        Button {
+                            showingCreateAlbum = true
+                        } label: {
+                            Label("New Album", systemImage: "plus")
+                        }
+                    }
+                }
+            }
+            .alert("创建新相册", isPresented: $showingCreateAlbum) {
+                TextField("相册名称", text: $newAlbumName)
+                Button("取消", role: .cancel) {
+                    newAlbumName = ""
+                }
+                Button("创建", action: createAlbum)
+            } message: {
+                Text("为导入的图片建立一个明确用途的相册，便于后续整理。")
+            }
+            .sheet(isPresented: $showingSettings) {
+                VaultSettingsView(
+                    itemCount: vaultManager.mediaItems.count,
+                    storageUsage: vaultManager.storageUsage
+                )
+            }
+            .alert(item: $albumPendingDeletion) { album in
+                Alert(
+                    title: Text("删除相册？"),
+                    message: Text("“\(album.name)”中的所有加密图片都会一起删除。这个操作不能撤销。"),
+                    primaryButton: .destructive(Text("删除")) {
+                        try? vaultManager.deleteAlbum(album)
+                    },
+                    secondaryButton: .cancel()
+                )
+            }
+        }
+    }
+
+    private func createAlbum() {
+        defer { newAlbumName = "" }
+        try? vaultManager.createAlbum(name: newAlbumName)
+    }
+
+    private func requestAlbumDeletion(at offsets: IndexSet) {
+        let albums = vaultManager.getAlbums()
+        guard let index = offsets.first else { return }
+        if albums.indices.contains(index) {
+            albumPendingDeletion = albums[index]
         }
     }
 }
 
-struct WebViewPlaceholder: View {
+struct AlbumRow: View {
+    let album: VaultAlbum
+
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .font(.system(size: 50))
-                .foregroundColor(.gray)
-            Text("网页内容")
-                .foregroundColor(.gray)
+        VStack(alignment: .leading, spacing: 4) {
+            Text(album.name)
+                .font(.headline)
+            Text("\(album.itemCount) encrypted photos")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
         }
+        .padding(.vertical, 4)
     }
 }
-
-// MARK: - 相册详情视图
 
 struct AlbumDetailView: View {
     let album: VaultAlbum
-    
+
+    @EnvironmentObject private var vaultManager: VaultManager
+    @EnvironmentObject private var privacyPreferencesStore: VaultPrivacyPreferencesStore
+
+    @State private var selectedMediaItem: VaultMediaItem?
+    @State private var errorMessage: String?
+    @State private var isImporting = false
+    @State private var isShowingPhotoPicker = false
+    @State private var isShowingImportEducation = false
+    @State private var mediaItemPendingDeletion: VaultMediaItem?
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 12)
+    ]
+
     var body: some View {
-        VStack {
-            Text(album.name)
-                .font(.title)
-            
-            Text("\(album.itemCount) 个项目")
-                .foregroundColor(.secondary)
-            
-            // 媒体网格
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3)) {
-                ForEach(0..<album.itemCount) { i in
-                    Rectangle()
-                        .aspectRatio(1, contentMode: .fit)
-                        .background(Color.gray.opacity(0.3))
-                        .cornerRadius(5)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(album.name)
+                            .font(.title2.bold())
+                        Text("\(vaultManager.getMediaItems(albumId: album.id).count) encrypted photos")
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button {
+                        startImportFlow()
+                    } label: {
+                        Label("导入", systemImage: "photo.badge.plus")
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+
+                if isImporting {
+                    ProgressView("Importing selected photos...")
+                }
+
+                if let errorMessage {
+                    Text(errorMessage)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
+
+                LazyVGrid(columns: columns, spacing: 12) {
+                    ForEach(vaultManager.getMediaItems(albumId: album.id)) { item in
+                        VaultThumbnailCell(item: item) {
+                            selectedMediaItem = item
+                        }
+                        .contextMenu {
+                            Button(role: .destructive) {
+                                mediaItemPendingDeletion = item
+                            } label: {
+                                Label("删除", systemImage: "trash")
+                            }
+                        }
+                    }
+                }
+            }
+            .padding()
+        }
+        .navigationTitle(album.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $isShowingPhotoPicker) {
+            VaultPhotoPicker { results in
+                Task {
+                    await importSelectedImages(results)
                 }
             }
         }
-        .padding()
-        .navigationTitle(album.name)
+        .sheet(isPresented: $isShowingImportEducation) {
+            VaultImportEducationView(
+                dontShowAgain: !privacyPreferencesStore.preferences.showsImportEducation,
+                onDontShowAgainChanged: { shouldSkipInFuture in
+                    privacyPreferencesStore.update { preferences in
+                        preferences.showsImportEducation = !shouldSkipInFuture
+                    }
+                },
+                onContinue: {
+                    isShowingImportEducation = false
+                    isShowingPhotoPicker = true
+                },
+                onCancel: {
+                    isShowingImportEducation = false
+                }
+            )
+        }
+        .sheet(item: $selectedMediaItem) { item in
+            VaultPreviewView(item: item)
+        }
+        .alert(item: $mediaItemPendingDeletion) { item in
+            Alert(
+                title: Text("删除这张图片？"),
+                message: Text("这会移除本地加密文件、缩略图和对应密钥引用。这个操作不能撤销。"),
+                primaryButton: .destructive(Text("删除")) {
+                    try? vaultManager.deleteMediaItem(item)
+                },
+                secondaryButton: .cancel()
+            )
+        }
+    }
+
+    private func importSelectedImages(_ images: [VaultImportedPhoto]) async {
+        guard !images.isEmpty else { return }
+        isImporting = true
+        errorMessage = nil
+
+        defer {
+            isImporting = false
+        }
+
+        for image in images {
+            do {
+                try vaultManager.importPhoto(
+                    to: album.id,
+                    data: image.data,
+                    sourceIdentifier: image.identifier
+                )
+            } catch {
+                errorMessage = error.localizedDescription
+                break
+            }
+        }
+    }
+
+    private func startImportFlow() {
+        if privacyPreferencesStore.preferences.showsImportEducation {
+            isShowingImportEducation = true
+        } else {
+            isShowingPhotoPicker = true
+        }
+    }
+}
+
+struct VaultThumbnailCell: View {
+    let item: VaultMediaItem
+    let onTap: () -> Void
+
+    @EnvironmentObject private var vaultManager: VaultManager
+
+    @State private var image: UIImage?
+
+    var body: some View {
+        Button(action: onTap) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(Color(.secondarySystemBackground))
+
+                if let image {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    ProgressView()
+                }
+            }
+            .frame(height: 110)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+        }
+        .buttonStyle(.plain)
+        .task(id: item.id) {
+            guard image == nil else { return }
+            if let thumbnail = try? vaultManager.thumbnailImage(for: item) {
+                image = thumbnail
+            }
+        }
+    }
+}
+
+struct VaultPreviewView: View {
+    let item: VaultMediaItem
+
+    @EnvironmentObject private var vaultManager: VaultManager
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var image: UIImage?
+    @State private var errorMessage: String?
+
+    var body: some View {
+        NavigationView {
+            Group {
+                if let image {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .padding()
+                        .background(Color.black.opacity(0.96))
+                } else if let errorMessage {
+                    VaultEmptyStateView(
+                        title: "无法解密图片",
+                        systemImage: "exclamationmark.triangle",
+                        message: errorMessage
+                    )
+                } else {
+                    ProgressView("Decrypting photo...")
+                }
+            }
+            .task {
+                do {
+                    image = try vaultManager.image(for: item)
+                } catch {
+                    errorMessage = error.localizedDescription
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("关闭") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct VaultSettingsView: View {
+    @EnvironmentObject private var privacyPreferencesStore: VaultPrivacyPreferencesStore
+    @EnvironmentObject private var lockManager: VaultLockManager
+    @Environment(\.dismiss) private var dismiss
+
+    let itemCount: Int
+    let storageUsage: Int64
+
+    var body: some View {
+        NavigationView {
+            List {
+                Section("Privacy Controls") {
+                    Toggle(
+                        "Lock vault when app leaves the foreground",
+                        isOn: binding(for: \.autoLockOnBackground)
+                    )
+                    Toggle(
+                        "Allow biometric unlock",
+                        isOn: binding(for: \.allowsBiometricUnlock)
+                    )
+                    .disabled(lockManager.biometricType == .none)
+
+                    if lockManager.biometricType == .none {
+                        Text("This device does not currently offer Face ID or Touch ID for vault unlock.")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                Section("How This App Handles Data") {
+                    Label("Photos are imported with the system picker after direct user action.", systemImage: "hand.tap")
+                    Label("Imported images are encrypted and stored locally on this device.", systemImage: "lock.doc")
+                    Label("This version does not include cloud sync or remote backup.", systemImage: "icloud.slash")
+                    Label("Deleting an item in the vault removes its encrypted file and key reference from local storage.", systemImage: "trash")
+                }
+                .font(.subheadline)
+
+                Section("Current Vault") {
+                    Label("\(itemCount) encrypted items", systemImage: "photo.stack")
+                    Label(ByteCountFormatter.string(fromByteCount: storageUsage, countStyle: .file), systemImage: "internaldrive")
+                }
+
+                Section("Review-Safe Product Scope") {
+                    Text("PhotoVault Pro is a straightforward local privacy tool. It does not disguise itself as another app, does not hide secret entry points, and does not claim server-side security.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .navigationTitle("Settings & Privacy")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+
+    private func binding(for keyPath: WritableKeyPath<VaultPrivacyPreferences, Bool>) -> Binding<Bool> {
+        Binding(
+            get: { privacyPreferencesStore.preferences[keyPath: keyPath] },
+            set: { newValue in
+                privacyPreferencesStore.update { preferences in
+                    preferences[keyPath: keyPath] = newValue
+                }
+            }
+        )
+    }
+}
+
+struct VaultImportEducationView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var dontShowAgain: Bool
+
+    let onDontShowAgainChanged: (Bool) -> Void
+    let onContinue: () -> Void
+    let onCancel: () -> Void
+
+    init(
+        dontShowAgain: Bool,
+        onDontShowAgainChanged: @escaping (Bool) -> Void,
+        onContinue: @escaping () -> Void,
+        onCancel: @escaping () -> Void
+    ) {
+        _dontShowAgain = State(initialValue: dontShowAgain)
+        self.onDontShowAgainChanged = onDontShowAgainChanged
+        self.onContinue = onContinue
+        self.onCancel = onCancel
+    }
+
+    var body: some View {
+        NavigationView {
+            List {
+                Section("Before You Import") {
+                    Label("Only the photos you select in the system picker are imported.", systemImage: "checkmark.shield")
+                    Label("Imported files are copied into the encrypted vault on this device.", systemImage: "lock.doc")
+                    Label("Deleting the original from Photos does not automatically remove the encrypted copy in the vault.", systemImage: "photo.badge.exclamationmark")
+                    Label("You can delete any imported item later from inside its album.", systemImage: "trash")
+                }
+                .font(.subheadline)
+
+                Section {
+                    Toggle("Don’t show this reminder again", isOn: $dontShowAgain)
+                        .onChange(of: dontShowAgain) { newValue in
+                            onDontShowAgainChanged(newValue)
+                        }
+                }
+            }
+            .navigationTitle("Import Reminder")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Cancel") {
+                        onCancel()
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Continue") {
+                        onContinue()
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct VaultEmptyStateView: View {
+    let title: String
+    let systemImage: String
+    let message: String
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: systemImage)
+                .font(.system(size: 36))
+                .foregroundColor(.secondary)
+            Text(title)
+                .font(.headline)
+            Text(message)
+                .font(.subheadline)
+                .multilineTextAlignment(.center)
+                .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 24)
+    }
+}
+
+struct VaultImportedPhoto {
+    let data: Data
+    let identifier: String?
+}
+
+struct VaultPhotoPicker: UIViewControllerRepresentable {
+    let onComplete: ([VaultImportedPhoto]) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onComplete: onComplete)
+    }
+
+    func makeUIViewController(context: Context) -> PHPickerViewController {
+        var configuration = PHPickerConfiguration(photoLibrary: .shared())
+        configuration.filter = .images
+        configuration.selectionLimit = 20
+
+        let controller = PHPickerViewController(configuration: configuration)
+        controller.delegate = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+        private let onComplete: ([VaultImportedPhoto]) -> Void
+
+        init(onComplete: @escaping ([VaultImportedPhoto]) -> Void) {
+            self.onComplete = onComplete
+        }
+
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            picker.dismiss(animated: true)
+
+            guard !results.isEmpty else {
+                onComplete([])
+                return
+            }
+
+            let dispatchGroup = DispatchGroup()
+            let lock = NSLock()
+            var importedPhotos: [VaultImportedPhoto] = []
+
+            for result in results {
+                guard result.itemProvider.canLoadObject(ofClass: UIImage.self) else {
+                    continue
+                }
+
+                dispatchGroup.enter()
+                result.itemProvider.loadObject(ofClass: UIImage.self) { object, _ in
+                    defer { dispatchGroup.leave() }
+
+                    guard let image = object as? UIImage,
+                          let data = image.jpegData(compressionQuality: 0.92) else {
+                        return
+                    }
+
+                    lock.lock()
+                    importedPhotos.append(
+                        VaultImportedPhoto(
+                            data: data,
+                            identifier: result.assetIdentifier
+                        )
+                    )
+                    lock.unlock()
+                }
+            }
+
+            dispatchGroup.notify(queue: .main) {
+                self.onComplete(importedPhotos)
+            }
+        }
     }
 }
